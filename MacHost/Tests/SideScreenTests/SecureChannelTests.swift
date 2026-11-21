@@ -115,4 +115,22 @@ final class SecureChannelTests: XCTestCase {
         XCTAssertTrue(LANAddressResolver.Candidate(interface: "utun4", ip: "10.0.0.2").isVPN)
         XCTAssertFalse(LANAddressResolver.Candidate(interface: "en0", ip: "192.168.1.10").isVPN)
     }
+
+    func testPairingHostPrefersCustomEntry() throws {
+        let suite = "SecureChannelTests.pairingHost"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        defaults.set(LANAddressResolver.customPairingHostTag, forKey: LANAddressResolver.pairingHostDefaultsKey)
+        defaults.set(" my-mac.tailnet.ts.net ", forKey: LANAddressResolver.customPairingHostDefaultsKey)
+        XCTAssertEqual(LANAddressResolver.pairingIPv4(defaults: defaults), "my-mac.tailnet.ts.net")
+
+        // An empty custom entry falls back to automatic.
+        defaults.set("", forKey: LANAddressResolver.customPairingHostDefaultsKey)
+        XCTAssertEqual(LANAddressResolver.pairingIPv4(defaults: defaults), LANAddressResolver.primaryIPv4())
+
+        // A picked address that has vanished also falls back to automatic.
+        defaults.set("203.0.113.9", forKey: LANAddressResolver.pairingHostDefaultsKey)
+        XCTAssertEqual(LANAddressResolver.pairingIPv4(defaults: defaults), LANAddressResolver.primaryIPv4())
+    }
 }
