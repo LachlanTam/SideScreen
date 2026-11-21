@@ -102,6 +102,7 @@ object AuthHandshake {
     /** Encrypted session request: [magic 4][client nonce 32][name_len 1][name N]. */
     val SECURE_REQ_MAGIC = byteArrayOf(0x53, 0x53, 0x57, 0x45) // "SSWE"
     private val SECURE_HELLO_MAGIC = byteArrayOf(0x53, 0x53, 0x57, 0x53) // "SSWS"
+
     /** Encrypted pairing request: [magic 4][P-256 public key 65][name_len 1][name N]. */
     val SECURE_PAIR_REQ_MAGIC = byteArrayOf(0x53, 0x53, 0x50, 0x45) // "SSPE"
     private val SECURE_PAIR_HELLO_MAGIC = byteArrayOf(0x53, 0x53, 0x50, 0x53) // "SSPS"

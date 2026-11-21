@@ -193,7 +193,7 @@ class WirelessTabController(
                 views.repairTitle.text = "⚠ Connection error"
                 views.repairMessage.text =
                     "Couldn't complete the encrypted handshake with the Mac. Make sure the Mac " +
-                        "and the tablet both run the updated Side Screen, then scan the QR again."
+                    "and the tablet both run the updated Side Screen, then scan the QR again."
                 transition(State.REPAIR_NEEDED)
             }
         }
