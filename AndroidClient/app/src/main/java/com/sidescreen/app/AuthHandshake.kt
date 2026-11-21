@@ -96,4 +96,65 @@ object AuthHandshake {
         val status = PairingStatus.forCode(bytes[4]) ?: return null
         return PairingHeader.Pairing(status)
     }
+
+    // --- Encrypted handshakes (see SecureChannel) ---
+
+    /** Encrypted session request: [magic 4][client nonce 32][name_len 1][name N]. */
+    val SECURE_REQ_MAGIC = byteArrayOf(0x53, 0x53, 0x57, 0x45) // "SSWE"
+    private val SECURE_HELLO_MAGIC = byteArrayOf(0x53, 0x53, 0x57, 0x53) // "SSWS"
+    /** Encrypted pairing request: [magic 4][P-256 public key 65][name_len 1][name N]. */
+    val SECURE_PAIR_REQ_MAGIC = byteArrayOf(0x53, 0x53, 0x50, 0x45) // "SSPE"
+    private val SECURE_PAIR_HELLO_MAGIC = byteArrayOf(0x53, 0x53, 0x50, 0x53) // "SSPS"
+
+    private fun nameBytes(deviceName: String): ByteArray {
+        val bytes = deviceName.toByteArray(Charsets.UTF_8)
+        require(bytes.size in 1..64) { "deviceName UTF-8 length must be 1..64, got ${bytes.size}" }
+        return bytes
+    }
+
+    fun encodeSecureRequest(
+        clientNonce: ByteArray,
+        deviceName: String,
+    ): ByteArray {
+        require(clientNonce.size == 32) { "nonce must be 32 bytes" }
+        val name = nameBytes(deviceName)
+        return SECURE_REQ_MAGIC + clientNonce + byteArrayOf(name.size.toByte()) + name
+    }
+
+    /**
+     * Header of the SSWS server hello [magic 4][status 1]. When status is OK
+     * the caller then reads [host nonce 32][host proof 32]. Returns null on
+     * garbage. An SSWR answer means the Mac predates encryption (or refused).
+     */
+    sealed class SecureHelloHeader {
+        data class Hello(val status: ResponseStatus) : SecureHelloHeader()
+
+        data class Plain(val status: ResponseStatus) : SecureHelloHeader()
+    }
+
+    fun parseSecureHelloHeader(bytes: ByteArray): SecureHelloHeader? {
+        if (bytes.size < 5) return null
+        val status = ResponseStatus.forCode(bytes[4]) ?: return null
+        if ((0..3).all { bytes[it] == SECURE_HELLO_MAGIC[it] }) return SecureHelloHeader.Hello(status)
+        if ((0..3).all { bytes[it] == RES_MAGIC[it] }) return SecureHelloHeader.Plain(status)
+        return null
+    }
+
+    fun encodeSecurePairingRequest(
+        publicKey: ByteArray,
+        deviceName: String,
+    ): ByteArray {
+        require(publicKey.size == 65) { "P-256 public key must be 65 bytes" }
+        val name = nameBytes(deviceName)
+        return SECURE_PAIR_REQ_MAGIC + publicKey + byteArrayOf(name.size.toByte()) + name
+    }
+
+    /** SSPS [magic 4][status 1] (then host key 65 when OK). SSWR = old Mac. */
+    fun parseSecurePairingHelloHeader(bytes: ByteArray): PairingHeader? {
+        if (bytes.size < 5) return null
+        if ((0..3).all { bytes[it] == RES_MAGIC[it] }) return PairingHeader.LegacyHost
+        for (i in 0..3) if (bytes[i] != SECURE_PAIR_HELLO_MAGIC[i]) return null
+        val status = PairingStatus.forCode(bytes[4]) ?: return null
+        return PairingHeader.Pairing(status)
+    }
 }

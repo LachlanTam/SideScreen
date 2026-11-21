@@ -144,7 +144,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshStatusIndicators() {
         settings.adbInstalled = StatusDetector.adbInstalled()
         settings.wifiConnected = StatusDetector.wifiReachable()
-        settings.listeningAddress = LANAddressResolver.primaryIPv4()
+        settings.listeningAddress = LANAddressResolver.pairingIPv4()
 
         // "Displays have separate Spaces" off → any fullscreen app blanks the
         // virtual display (#50). Nothing we can do about it from capture side;

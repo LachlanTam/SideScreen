@@ -1422,7 +1422,7 @@ class MainActivity : AppCompatActivity() {
                                 when (e) {
                                     is StreamClient.WirelessConnectError.NetworkUnreachable ->
                                         "No response from $host:$port. Check both devices are " +
-                                            "on the same WiFi and the Mac app is running."
+                                            "on the same WiFi or VPN (e.g. Tailscale) and the Mac app is running."
                                     else -> "Connection error — try again."
                                 },
                             )

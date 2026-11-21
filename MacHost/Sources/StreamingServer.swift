@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Network
 import os
@@ -162,6 +163,20 @@ class StreamingServer {
     private let port: UInt16
     private var listener: NWListener?
     private var connection: NWConnection?
+    /// Connections that have not passed admission yet (loopback first byte,
+    /// or the wireless handshake). They never touch `connection` or session
+    /// state, so a port scan or a rejected peer can no longer drop the tablet
+    /// that is streaming (upstream issue #69). Only touched on networkQueue.
+    private var pendingConnections: [ObjectIdentifier: NWConnection] = [:]
+    /// Pending connections that have not been admitted by then are closed.
+    private static let admissionTimeout: TimeInterval = 10
+    /// Encryption for the active wireless session; nil over USB (loopback).
+    private var sealer: RecordSealer?
+    private var opener: RecordOpener?
+    /// The admitted connection whose end should fire onClientDisconnected.
+    /// Separate from `connection` so stop(), which nils `connection` before
+    /// the cancel callback lands, still reports the disconnect.
+    private var activeConnectionId: ObjectIdentifier?
     var onClientConnected: (() -> Void)?
     var onClientDisconnected: (() -> Void)?
     /// Fired once per connection during protocol startup, BEFORE the display
@@ -355,12 +370,73 @@ class StreamingServer {
     }
 
     private func handleConnection(_ newConnection: NWConnection) {
-        debugLog("New connection incoming...")
+        debugLog("New connection incoming (pending admission)...")
+        let id = ObjectIdentifier(newConnection)
+        pendingConnections[id] = newConnection
 
-        // Clean up old connection properly
+        // Captures the connection strongly (as before); connectionEnded()
+        // clears the handler to break the cycle once it is finished.
+        newConnection.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            let conn = newConnection
+            debugLog("Connection state: \(state)")
+            switch state {
+            case .ready:
+                self.onConnectionReady(conn)
+            case .failed(let error):
+                debugLog("Connection failed: \(error)")
+                self.connectionEnded(conn)
+            case .cancelled:
+                debugLog("Connection cancelled")
+                self.connectionEnded(conn)
+            default:
+                break
+            }
+        }
+
+        networkQueue.asyncAfter(deadline: .now() + Self.admissionTimeout) { [weak self, weak newConnection] in
+            guard let self = self, let conn = newConnection,
+                  self.pendingConnections[ObjectIdentifier(conn)] != nil else { return }
+            debugLog("Closing connection that was not admitted within \(Self.admissionTimeout)s")
+            conn.cancel()
+        }
+
+        newConnection.start(queue: networkQueue)
+    }
+
+    private func connectionEnded(_ conn: NWConnection) {
+        pendingConnections.removeValue(forKey: ObjectIdentifier(conn))
+        conn.stateUpdateHandler = nil
+        // Only the admitted, active connection counts as a client leaving.
+        if ObjectIdentifier(conn) == activeConnectionId {
+            activeConnectionId = nil
+            onClientDisconnected?()
+        }
+    }
+
+    /// Swaps an admitted connection in as the active client. Everything that
+    /// used to happen the moment a TCP connection arrived now happens here,
+    /// after the peer has proved itself.
+    private func adopt(
+        _ newConnection: NWConnection,
+        deviceName: String?,
+        sessionKeys: SecureChannel.SessionKeys?,
+        initialBytes: Data = Data()
+    ) {
+        guard !isStopped else {
+            newConnection.cancel()
+            return
+        }
+        pendingConnections.removeValue(forKey: ObjectIdentifier(newConnection))
+
         if let oldConnection = connection {
             isReceiving = false
+            connection = nil
             oldConnection.cancel()
+            if activeConnectionId == ObjectIdentifier(oldConnection) {
+                activeConnectionId = nil
+                onClientDisconnected?()
+            }
         }
 
         connectionReady = false
@@ -370,37 +446,66 @@ class StreamingServer {
         clientDecodeLimitTable = nil
         clientSupportsDesktopGeometry = false
         clientIdentity = nil
-        handshakeDeviceName = nil
+        handshakeDeviceName = deviceName
         startupPrepared = false
         startupHeld = false
         waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
-        connection = newConnection
         droppedFrames = 0
-
-        connection?.stateUpdateHandler = { [weak self] state in
-            debugLog("Connection state: \(state)")
-            switch state {
-            case .ready:
-                self?.onConnectionReady(newConnection)
-            case .failed(let error):
-                debugLog("Connection failed: \(error)")
-                self?.onClientDisconnected?()
-            case .cancelled:
-                debugLog("Connection cancelled")
-                self?.onClientDisconnected?()
-            default:
-                break
-            }
+        if let keys = sessionKeys {
+            sealer = RecordSealer(key: keys.hostToClient)
+            opener = RecordOpener(key: keys.clientToHost)
+        } else {
+            sealer = nil
+            opener = nil
         }
+        connection = newConnection
+        activeConnectionId = ObjectIdentifier(newConnection)
 
-        connection?.start(queue: networkQueue)
+        beginExistingProtocol(on: newConnection)
+        if !initialBytes.isEmpty {
+            inputBuffer.append(initialBytes)
+            processInputBuffer(connection: newConnection)
+        }
+    }
+
+    /// Sends `data` on the active session, encrypting it when the session is
+    /// a wireless one. `sealer` must be the one captured alongside `conn`.
+    private func wireSend(
+        _ data: Data,
+        on conn: NWConnection,
+        sealer: RecordSealer?,
+        completion: ((NWError?) -> Void)? = nil
+    ) {
+        guard let sealer = sealer else {
+            conn.send(content: data, completion: .contentProcessed { completion?($0) })
+            return
+        }
+        do {
+            try sealer.seal(data) { wire in
+                conn.send(content: wire, completion: .contentProcessed { completion?($0) })
+            }
+        } catch {
+            debugLog("Encrypt failed (\(error)) — closing connection")
+            conn.cancel()
+        }
     }
 
     private func onConnectionReady(_ conn: NWConnection) {
         if conn.endpoint.isLoopback {
-            debugLog("Client connected via loopback (USB) — skipping auth")
-            beginExistingProtocol(on: conn)
+            // Over USB (adb reverse) there is no handshake, so wait for the
+            // client's first capability bytes before taking over the session.
+            // A probe that connects and closes without sending anything is
+            // then never mistaken for a tablet.
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+                guard let self = self else { return }
+                guard error == nil, let data = data, !data.isEmpty else {
+                    if error != nil || isComplete { conn.cancel() }
+                    return
+                }
+                debugLog("Client connected via loopback (USB) — skipping auth")
+                self.adopt(conn, deviceName: nil, sessionKeys: nil, initialBytes: data)
+            }
             return
         }
         guard let expected = expectedAuthToken else {
@@ -408,7 +513,7 @@ class StreamingServer {
             conn.cancel()
             return
         }
-        debugLog("Client connected via LAN — running auth handshake")
+        debugLog("Client connected via network — running encrypted handshake")
         runAuthHandshake(connection: conn, expectedToken: expected)
     }
 
@@ -444,7 +549,7 @@ class StreamingServer {
             // display config so the client knows the codec before it sizes
             // and configures its decoder.
             let msg = Data([WireMessage.codecSelected, codec.wireId])
-            conn.send(content: msg, completion: .contentProcessed { _ in })
+            wireSend(msg, on: conn, sealer: sealer)
             debugLog("Sent codecSelected: H.264")
         }
         // Synchronous, before sendDisplaySize(): the handler switches the
@@ -460,7 +565,7 @@ class StreamingServer {
     }
 
     private func runAuthHandshake(connection conn: NWConnection, expectedToken: Data) {
-        // Read fixed prefix [magic 4][token 32][name_len 1] = 37 bytes.
+        // Read the shared fixed prefix [magic 4][32 bytes][1 byte] = 37 bytes.
         conn.receive(minimumIncompleteLength: HandshakeCodec.fixedPrefixLen,
                      maximumLength: HandshakeCodec.fixedPrefixLen) { [weak self] prefixData, _, _, error in
             guard let self = self else { return }
@@ -473,42 +578,75 @@ class StreamingServer {
                 self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
                 return
             }
-            let prefixBytes = Array(prefix)
-            if Array(prefixBytes[0..<4]) == HandshakeCodec.pairingRequestMagic {
-                self.runPairingExchange(connection: conn, prefix: prefix)
-                return
-            }
-            guard Array(prefixBytes[0..<4]) == HandshakeCodec.requestMagic else {
+            switch Array(Array(prefix)[0..<4]) {
+            case HandshakeCodec.secureRequestMagic:
+                self.runSecureSession(connection: conn, prefix: prefix, expectedToken: expectedToken)
+            case HandshakeCodec.securePairingRequestMagic:
+                self.runSecurePairing(connection: conn, prefix: prefix)
+            case HandshakeCodec.requestMagic, HandshakeCodec.pairingRequestMagic:
+                // The old plaintext handshakes sent the token (or handed it
+                // out) in the clear. They are refused; the old Android app
+                // shows "update" / "rescan" for this answer.
+                debugLog("Refusing legacy plaintext handshake — update Side Screen on the tablet")
                 self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
-                return
-            }
-            self.receiveNameSuffix(on: conn, prefix: prefix, onInvalid: {
-                self.sendAuthResponse(conn, status: .invalidName, thenClose: true)
-            }) { full in
-                do {
-                    let parsed = try HandshakeCodec.parseRequest(full)
-                    if WirelessAuth.validate(parsed.token, expected: expectedToken) {
-                        debugLog("Wireless auth OK — device: \(parsed.deviceName)")
-                        self.sendAuthResponse(conn, status: .ok, thenClose: false)
-                        self.handshakeDeviceName = parsed.deviceName
-                        self.onWirelessClientPaired?(parsed.deviceName)
-                        self.beginExistingProtocol(on: conn)
-                    } else {
-                        debugLog("Wireless auth rejected: token mismatch")
-                        self.sendAuthResponse(conn, status: .invalidToken, thenClose: true)
-                    }
-                } catch HandshakeError.invalidMagic {
-                    self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
-                } catch HandshakeError.invalidName {
-                    self.sendAuthResponse(conn, status: .invalidName, thenClose: true)
-                } catch {
-                    self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
-                }
+            default:
+                self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
             }
         }
     }
 
-    /// Reads the variable `[name N]` tail shared by SSWA and SSPC requests and
+    /// SSWE: mutual proof of the token, then an encrypted session. The token
+    /// itself never crosses the network.
+    private func runSecureSession(connection conn: NWConnection, prefix: Data, expectedToken: Data) {
+        let fail: (HandshakeStatus) -> Void = { status in
+            let bytes = HandshakeCodec.encodeSecureServerHello(status: status)
+            conn.send(content: bytes, completion: .contentProcessed { _ in conn.cancel() })
+        }
+        receiveNameSuffix(on: conn, prefix: prefix, onInvalid: { fail(.invalidName) }) { [weak self] full in
+            guard let self = self else { return }
+            let hello: ParsedSecureHello
+            do {
+                hello = try HandshakeCodec.parseSecureHello(full)
+            } catch HandshakeError.invalidName {
+                fail(.invalidName)
+                return
+            } catch {
+                fail(.invalidMagic)
+                return
+            }
+            let hostNonce = SecureChannel.randomNonce()
+            let keys = SecureChannel.deriveSessionKeys(
+                token: expectedToken,
+                clientHello: hello.raw,
+                clientNonce: hello.clientNonce,
+                hostNonce: hostNonce
+            )
+            let serverHello = HandshakeCodec.encodeSecureServerHello(
+                status: .ok, hostNonce: hostNonce, hostProof: keys.hostProof
+            )
+            conn.send(content: serverHello, completion: .contentProcessed { _ in })
+            conn.receive(minimumIncompleteLength: SecureChannel.proofLength,
+                         maximumLength: SecureChannel.proofLength) { [weak self] proofData, _, _, error in
+                guard let self = self else { return }
+                guard error == nil, let proof = proofData, proof.count == SecureChannel.proofLength else {
+                    debugLog("Secure handshake: no client proof")
+                    conn.cancel()
+                    return
+                }
+                guard SecureChannel.constantTimeEquals(proof, keys.clientProof) else {
+                    debugLog("Wireless auth rejected: client proof mismatch (wrong or reset token)")
+                    self.sendAuthResponse(conn, status: .invalidToken, thenClose: true)
+                    return
+                }
+                debugLog("Wireless auth OK (encrypted) — device: \(hello.deviceName)")
+                self.sendAuthResponse(conn, status: .ok, thenClose: false)
+                self.onWirelessClientPaired?(hello.deviceName)
+                self.adopt(conn, deviceName: hello.deviceName, sessionKeys: keys)
+            }
+        }
+    }
+
+    /// Reads the variable `[name N]` tail shared by SSWA, SSWE and SSPC requests and
     /// hands back the full request bytes. `onInvalid` fires for a bad name
     /// length or a short read; read errors cancel the connection.
     private func receiveNameSuffix(
@@ -517,7 +655,7 @@ class StreamingServer {
         onInvalid: @escaping () -> Void,
         completion: @escaping (Data) -> Void
     ) {
-        let nameLen = Int(Array(prefix)[36])
+        let nameLen = Int(prefix[prefix.startIndex + prefix.count - 1])
         guard (1...64).contains(nameLen) else {
             onInvalid()
             return
@@ -536,40 +674,85 @@ class StreamingServer {
         }
     }
 
-    /// Handles a pre-auth "SSPC" code-pairing request (issue #35). On a valid
-    /// one-time code, answers with the real 32-byte token + Mac name and closes;
-    /// the client then reconnects through the normal SSWA handshake.
-    private func runPairingExchange(connection conn: NWConnection, prefix: Data) {
-        receiveNameSuffix(on: conn, prefix: prefix, onInvalid: { [weak self] in
-            self?.sendPairingResponse(conn, status: .invalidCode)
-        }) { [weak self] full in
+    /// SSPE: code pairing over an ephemeral P-256 ECDH exchange. The tablet
+    /// proves it knows the one-time code; the token goes back sealed with a
+    /// key only the two ends can derive, then the connection closes and the
+    /// tablet reconnects through SSWE.
+    private func runSecurePairing(connection conn: NWConnection, prefix: Data) {
+        let failHello: () -> Void = {
+            let bytes = HandshakeCodec.encodeSecurePairingServerHello(status: .invalidCode)
+            conn.send(content: bytes, completion: .contentProcessed { _ in conn.cancel() })
+        }
+        let extra = HandshakeCodec.securePairingExtraPrefixLen
+        conn.receive(minimumIncompleteLength: extra, maximumLength: extra) { [weak self] extraData, _, _, error in
             guard let self = self else { return }
-            do {
-                let parsed = try HandshakeCodec.parsePairingRequest(full)
-                switch self.consumePairingCode(candidate: parsed.code) {
-                case .issued(let token):
-                    debugLog("Pairing code accepted — issuing token to \(parsed.deviceName)")
-                    self.sendPairingResponse(conn, status: .ok, token: token)
-                    self.onPairingSuccess?(parsed.deviceName)
-                case .rejected:
-                    debugLog("Pairing code rejected")
-                    self.sendPairingResponse(conn, status: .invalidCode)
-                case .exhausted:
-                    debugLog("Pairing code rejected — attempt budget exhausted, invalidating code")
-                    self.sendPairingResponse(conn, status: .invalidCode)
-                    self.onPairingCodeExhausted?()
+            guard error == nil, let extraData = extraData, extraData.count == extra else {
+                conn.cancel()
+                return
+            }
+            self.receiveNameSuffix(on: conn, prefix: prefix + extraData, onInvalid: failHello) { [weak self] full in
+                guard let self = self else { return }
+                guard self.expectedPairingCode != nil else {
+                    debugLog("Pairing request but no code is active")
+                    failHello()
+                    return
                 }
-            } catch {
-                // Malformed requests carry no code guess, so they don't touch
-                // the attempt budget.
-                debugLog("Malformed pairing request: \(error)")
-                self.sendPairingResponse(conn, status: .invalidCode)
+                let request: ParsedSecurePairingRequest
+                let hostKey = P256.KeyAgreement.PrivateKey()
+                let shared: Data
+                do {
+                    request = try HandshakeCodec.parseSecurePairingRequest(full)
+                    let clientKey = try P256.KeyAgreement.PublicKey(x963Representation: request.clientPublicKey)
+                    shared = try hostKey.sharedSecretFromKeyAgreement(with: clientKey).withUnsafeBytes { Data($0) }
+                } catch {
+                    // Malformed requests carry no code guess, so they don't
+                    // touch the attempt budget.
+                    debugLog("Malformed pairing request: \(error)")
+                    failHello()
+                    return
+                }
+                let hostPub = hostKey.publicKey.x963Representation
+                let th = SecureChannel.pairingTranscriptHash(clientMessage: request.raw, hostPublicKey: hostPub)
+                let hello = HandshakeCodec.encodeSecurePairingServerHello(status: .ok, hostPublicKey: hostPub)
+                conn.send(content: hello, completion: .contentProcessed { _ in })
+
+                conn.receive(minimumIncompleteLength: SecureChannel.proofLength,
+                             maximumLength: SecureChannel.proofLength) { [weak self] proofData, _, _, error in
+                    guard let self = self else { return }
+                    guard error == nil, let proof = proofData, proof.count == SecureChannel.proofLength else {
+                        conn.cancel()
+                        return
+                    }
+                    let outcome = self.consumePairingCode { code in
+                        let keys = SecureChannel.derivePairingKeys(sharedSecret: shared, code: code, transcriptHash: th)
+                        return SecureChannel.constantTimeEquals(proof, keys.clientProof)
+                    }
+                    switch outcome {
+                    case .issued(let token, let code):
+                        let keys = SecureChannel.derivePairingKeys(sharedSecret: shared, code: code, transcriptHash: th)
+                        let payload = HandshakeCodec.encodePairingPayload(token: token, macName: self.pairingMacName)
+                        guard let sealed = try? SecureChannel.sealPairingPayload(payload, keys: keys) else {
+                            self.sendSecurePairingResponse(conn, status: .invalidCode)
+                            return
+                        }
+                        debugLog("Pairing code accepted — issuing sealed token to \(request.deviceName)")
+                        self.sendSecurePairingResponse(conn, status: .ok, sealed: sealed)
+                        self.onPairingSuccess?(request.deviceName)
+                    case .rejected:
+                        debugLog("Pairing code rejected")
+                        self.sendSecurePairingResponse(conn, status: .invalidCode)
+                    case .exhausted:
+                        debugLog("Pairing code rejected — attempt budget exhausted, invalidating code")
+                        self.sendSecurePairingResponse(conn, status: .invalidCode)
+                        self.onPairingCodeExhausted?()
+                    }
+                }
             }
         }
     }
 
     private enum PairingOutcome {
-        case issued(Data)
+        case issued(token: Data, code: String)
         case rejected
         case exhausted
     }
@@ -578,11 +761,12 @@ class StreamingServer {
     /// the code before the token leaves the lock, and the attempt counter is
     /// bumped under the same lock — so neither double redemption nor
     /// budget-overrun is possible however requests are pipelined.
-    private func consumePairingCode(candidate: String) -> PairingOutcome {
-        pairingStateLock.withLock { state in
+    /// `matches` is asked whether the client's proof fits the active code.
+    private func consumePairingCode(matches: (String) -> Bool) -> PairingOutcome {
+        pairingStateLock.withLockUnchecked { state in
             guard let expected = state.code,
                   let token = self.expectedAuthToken,
-                  PairingCode.validate(candidate, expected: expected) else {
+                  matches(PairingCode.normalize(expected)) else {
                 guard state.code != nil else { return .rejected }
                 state.failedAttempts += 1
                 if state.failedAttempts >= Self.maxPairingAttempts {
@@ -594,12 +778,12 @@ class StreamingServer {
             }
             state.code = nil
             state.failedAttempts = 0
-            return .issued(token)
+            return .issued(token: token, code: PairingCode.normalize(expected))
         }
     }
 
-    private func sendPairingResponse(_ conn: NWConnection, status: PairingStatus, token: Data? = nil) {
-        let bytes = HandshakeCodec.encodePairingResponse(status: status, token: token, macName: pairingMacName)
+    private func sendSecurePairingResponse(_ conn: NWConnection, status: PairingStatus, sealed: Data? = nil) {
+        let bytes = HandshakeCodec.encodeSecurePairingResponse(status: status, sealed: sealed)
         conn.send(content: bytes, completion: .contentProcessed { _ in
             // Pairing connections never stream: close after the reply either
             // way. On success the client reconnects with the issued token.
@@ -641,6 +825,7 @@ class StreamingServer {
 
     func sendDisplaySize() {
         guard let connection = connection else { return }
+        let sealer = self.sealer
 
         let transform = rotation + (flipHorizontal ? 1000 : 0) + (flipVertical ? 2000 : 0)
         var data = Data()
@@ -649,7 +834,7 @@ class StreamingServer {
         data.append(contentsOf: withUnsafeBytes(of: Int32(displayHeight).bigEndian) { Data($0) })
         data.append(contentsOf: withUnsafeBytes(of: Int32(transform).bigEndian) { Data($0) })
 
-        connection.send(content: data, completion: .contentProcessed { _ in })
+        wireSend(data, on: connection, sealer: sealer)
         debugLog("Sent display config: \(displayWidth)x\(displayHeight) @ \(rotation)°, h=\(flipHorizontal), v=\(flipVertical)")
         sendDesktopGeometry()
     }
@@ -658,12 +843,13 @@ class StreamingServer {
     private func sendDesktopGeometry() {
         guard clientSupportsDesktopGeometry, let connection = connection else { return }
         guard desktopWidth > 0, desktopHeight > 0 else { return }
+        let sealer = self.sealer
 
         var data = Data()
         data.append(WireMessage.desktopGeometry)
         data.append(contentsOf: withUnsafeBytes(of: Int32(desktopWidth).bigEndian) { Data($0) })
         data.append(contentsOf: withUnsafeBytes(of: Int32(desktopHeight).bigEndian) { Data($0) })
-        connection.send(content: data, completion: .contentProcessed { _ in })
+        wireSend(data, on: connection, sealer: sealer)
         debugLog("Sent desktop geometry: \(desktopWidth)x\(desktopHeight)")
     }
 
@@ -686,9 +872,14 @@ class StreamingServer {
             isReceiving = false
             return
         }
+        let opener = self.opener
+        // Encrypted records can be large; read in bigger chunks when wireless.
+        let maxRead = opener == nil ? 256 : 65536
 
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { [weak self] data, _, isComplete, error in
-            guard let self = self, self.isReceiving, !self.isStopped else { return }
+        connection.receive(minimumIncompleteLength: 1, maximumLength: maxRead) { [weak self] data, _, isComplete, error in
+            // A superseded connection's late completion must not touch the
+            // new client's receive state (upstream issue #69).
+            guard let self = self, connection === self.connection, self.isReceiving, !self.isStopped else { return }
 
             if error != nil || isComplete {
                 self.isReceiving = false
@@ -697,7 +888,18 @@ class StreamingServer {
             }
 
             if let data = data, !data.isEmpty {
-                self.inputBuffer.append(data)
+                if let opener = opener {
+                    do {
+                        self.inputBuffer.append(try opener.feed(data))
+                    } catch {
+                        debugLog("Decrypt failed (\(error)) — tampered or out-of-sync stream, closing")
+                        self.isReceiving = false
+                        connection.cancel()
+                        return
+                    }
+                } else {
+                    self.inputBuffer.append(data)
+                }
                 self.processInputBuffer(connection: connection)
             }
 
@@ -744,7 +946,7 @@ class StreamingServer {
                 var pong = Data(capacity: 9)
                 pong.append(WireMessage.pong) // Type: Pong
                 pong.append(clientTimestamp)
-                connection.send(content: pong, completion: .contentProcessed { _ in })
+                wireSend(pong, on: connection, sealer: sealer)
 
             case WireMessage.keyframeRequest:
                 // Keyframe request from Android decoder. The client sends a
@@ -938,6 +1140,7 @@ class StreamingServer {
 
     func sendFrame(_ data: Data, timestamp: UInt64, isKeyframe: Bool = false) {
         guard let connection = connection, !isStopped, connectionReady else { return }
+        let sealer = self.sealer
 
         // With short-GOP encoding, a fresh client must start on a keyframe —
         // sending P-frames before the first IDR would feed garbage to its decoder.
@@ -957,11 +1160,11 @@ class StreamingServer {
 
             let packet = self.makeFramePacket(data, timestamp: timestamp, isKeyframe: isKeyframe)
 
-            connection.send(content: packet, completion: .contentProcessed { error in
+            self.wireSend(packet, on: connection, sealer: sealer) { error in
                 if error != nil {
                     self.droppedFrames += 1
                 }
-            })
+            }
 
             // Track frame age at send time for pipeline profiling
             let sendAge = DispatchTime.now().uptimeNanoseconds - timestamp
@@ -1042,5 +1245,10 @@ class StreamingServer {
         listener?.cancel()
         connection = nil
         listener = nil
+        networkQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.pendingConnections.values.forEach { $0.cancel() }
+            self.pendingConnections.removeAll()
+        }
     }
 }

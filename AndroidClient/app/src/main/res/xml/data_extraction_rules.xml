@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+: keep the wireless pairing token out of cloud backups and
+     device-to-device transfers. Anyone holding it could connect to the Mac. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="paired_host.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="paired_host.xml" />
+    </device-transfer>
+</data-extraction-rules>
