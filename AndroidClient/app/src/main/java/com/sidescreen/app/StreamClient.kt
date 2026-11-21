@@ -351,6 +351,7 @@ class StreamClient(
         Log.i(TAG, "connectWireless: trying $host:$port (device=$deviceName)")
 
         val s = openWirelessSocket()
+
         fun fail(error: WirelessConnectError): Nothing {
             try {
                 s.close()
