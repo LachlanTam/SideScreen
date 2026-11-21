@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # "Run workflow" button on the Actions tab.
+  workflow_dispatch:
 
 jobs:
   build:
@@ -22,7 +24,14 @@ jobs:
         run: |
           cd AndroidClient
           chmod +x gradlew
-          ./gradlew assembleDebug
+          ./gradlew assembleDebug testDebugUnitTest
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideScreen-android-debug
+          path: AndroidClient/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
 
       - name: Lint
         run: |

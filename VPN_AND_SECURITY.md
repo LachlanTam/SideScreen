@@ -33,7 +33,17 @@ The tablet reconnects to whichever address it paired with. To switch between hom
 - **QR pairing is the strongest option.** The token travels only through the camera. Code pairing protects against anyone listening, but an attacker who can actively intercept traffic at the moment you pair could still guess the 8-digit code offline. Doing better would need a PAKE (password-authenticated key exchange). If you code-pair, do it on a network you trust, or over Tailscale, which already encrypts traffic with WireGuard.
 - **USB mode still trusts loopback.** Any program on the Mac can connect to the local port, as before (upstream issue #89).
 - **The Mac stores the token in UserDefaults**, not the Keychain, as before.
-- **This fork's builds are not signed with the upstream release keys.** Build the Mac app and the Android app from source (see the README). The Android build will not install over the Play Store version, so uninstall that first.
+- **This fork's builds are not signed with the upstream release keys.** Get them from GitHub Actions (below) or build from source (see the README).
+
+## Getting builds from GitHub
+
+1. On the fork, open the **Actions** tab and enable workflows (forks start with them turned off).
+2. Pick **Build macOS** or **Build Android** and click **Run workflow**. They also run on every push and pull request to `main`.
+3. When a run finishes, download the file under **Artifacts** at the bottom of its page:
+   - `SideScreen-mac`: a DMG (disk image). The app is ad-hoc signed, so after dragging it to Applications run `xattr -cr /Applications/SideScreen.app` once, or macOS will refuse to open it.
+   - `SideScreen-android-debug`: an APK (Android package). Copy it to the tablet and install it (allow installs from unknown sources when asked). It installs as a separate "debug" app beside the Play Store version, so the store app can stay installed.
+
+Each run also runs the unit tests for both apps, including the encryption test vectors.
 
 ## Protocol reference
 
