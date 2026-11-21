@@ -1629,6 +1629,10 @@ struct WirelessSection: View {
     let pairedDeviceStore: PairedDeviceStore
     @State private var qrImage: NSImage?
     @State private var pairedDevices: [PairedDevice] = []
+    /// Address that goes into the QR code; "" = automatic (primary LAN address).
+    /// Pick the Tailscale / VPN address to pair over a VPN.
+    @AppStorage(LANAddressResolver.pairingHostDefaultsKey) private var pairingHost: String = ""
+    @State private var addressCandidates: [LANAddressResolver.Candidate] = []
     @State private var showResetConfirm = false
     /// Used to force the relative-time labels to recompute every tick even when
     /// the underlying lastConnected timestamp hasn't changed (e.g. while a
@@ -1668,8 +1672,23 @@ struct WirelessSection: View {
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
-                    Text(LANAddressResolver.primaryIPv4().map { "Listening: \($0):\(settings.port)" } ?? "WiFi disconnected — no LAN address")
+                    Text(LANAddressResolver.pairingIPv4().map { "Listening: \($0):\(settings.port)" } ?? "WiFi disconnected — no LAN address")
                         .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.secondary)
+                    if addressCandidates.count > 1 {
+                        Picker("Address in QR", selection: $pairingHost) {
+                            Text("Automatic").tag("")
+                            ForEach(addressCandidates, id: \.self) { candidate in
+                                Text(candidate.label).tag(candidate.ip)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .controlSize(.small)
+                        .frame(maxWidth: 320)
+                        .help("Choose your Tailscale or other VPN address to pair and connect over the VPN.")
+                    }
+                    Text("Wireless connections are end-to-end encrypted (AES-256-GCM).")
+                        .font(.system(size: 10))
                         .foregroundColor(.secondary)
                     if let code = settings.pairingCode {
                         HStack(spacing: 10) {
@@ -1762,9 +1781,15 @@ struct WirelessSection: View {
         // two-parameter form requires macOS 14 and would block Ventura.
         // Deprecation is a compile-time warning only on Xcode 15+ SDKs.
         .onChange(of: settings.port) { _ in refreshQR() }
+        .onChange(of: pairingHost) { _ in refreshQR() }
         .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { now in
             nowTick = now
             refreshPaired()
+            let latest = LANAddressResolver.allIPv4()
+            if latest != addressCandidates {
+                addressCandidates = latest
+                refreshQR()
+            }
         }
         .alert("Reset Token?", isPresented: $showResetConfirm) {
             Button("Cancel", role: .cancel) { }
@@ -1781,7 +1806,8 @@ struct WirelessSection: View {
 
     private func refreshQR() {
         let token = WirelessAuth.loadOrCreate()
-        let host = LANAddressResolver.primaryIPv4() ?? "0.0.0.0"
+        addressCandidates = LANAddressResolver.allIPv4()
+        let host = LANAddressResolver.pairingIPv4() ?? "0.0.0.0"
         let name = Host.current().localizedName ?? "Mac"
         let url = PairingURL.build(host: host, port: settings.port, token: token, name: name)
         qrImage = QRRenderer.render(url: url, size: 180)

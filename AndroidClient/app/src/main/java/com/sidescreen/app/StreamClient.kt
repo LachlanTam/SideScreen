@@ -154,7 +154,7 @@ class StreamClient(
         }
 
     sealed class WirelessConnectError(msg: String) : Exception(msg) {
-        object NetworkUnreachable : WirelessConnectError("Mac unreachable — check both on same WiFi")
+        object NetworkUnreachable : WirelessConnectError("Mac unreachable — check both on same WiFi or VPN")
 
         object TokenRejected : WirelessConnectError("Token rejected — re-pair required")
 
@@ -178,29 +178,42 @@ class StreamClient(
     data class PairingSuccess(val token: ByteArray, val macName: String)
 
     /**
-     * Opens a TCP socket to host:port, bound to the active WiFi network. On some
-     * Android setups (especially LG/Android 12), an app's default outbound socket
-     * may take a route that silently drops LAN traffic; binding to the WIFI
-     * Network explicitly avoids that.
+     * Opens a TCP socket to host:port.
+     *
+     * On some Android setups (especially LG/Android 12), an app's default
+     * outbound socket may take a route that silently drops LAN traffic;
+     * binding to the WIFI Network explicitly avoids that. But a socket bound to
+     * Wi-Fi ignores VPN (virtual private network) routes, so a Mac reached
+     * through Tailscale, WireGuard or ZeroTier (e.g. a 100.x.x.x address) was
+     * unreachable (upstream issue #121). So: bind to Wi-Fi only when the Mac's
+     * address is actually on the Wi-Fi network's local subnet; otherwise use
+     * default routing, which respects the VPN.
      */
     private fun openWirelessSocket(): Socket {
         try {
             val sock = Socket()
             sock.tcpNoDelay = true
+            val dest = java.net.InetAddress.getByName(host)
             val cm = context.getSystemService(ConnectivityManager::class.java)
             val wifiNetwork =
                 cm.allNetworks.firstOrNull { net ->
                     val caps = cm.getNetworkCapabilities(net)
                     caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                        !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
                         caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 }
-            if (wifiNetwork != null) {
-                Log.i(TAG, "openWirelessSocket: binding socket to WiFi network $wifiNetwork")
-                wifiNetwork.bindSocket(sock)
+            val onWifiLan =
+                wifiNetwork != null &&
+                    cm.getLinkProperties(wifiNetwork)?.routes?.any { route ->
+                        !route.isDefaultRoute && route.matches(dest)
+                    } == true
+            if (onWifiLan) {
+                Log.i(TAG, "openWirelessSocket: $host is on the WiFi subnet, binding socket to $wifiNetwork")
+                wifiNetwork!!.bindSocket(sock)
             } else {
-                Log.w(TAG, "openWirelessSocket: no WiFi network found, using default routing")
+                Log.i(TAG, "openWirelessSocket: $host is not on the WiFi subnet, using default routing (VPN-friendly)")
             }
-            sock.connect(java.net.InetSocketAddress(host, port), 5000)
+            sock.connect(java.net.InetSocketAddress(dest, port), 5000)
             return sock
         } catch (e: java.net.SocketTimeoutException) {
             Log.e(TAG, "openWirelessSocket: TCP connect timeout to $host:$port (5s)")
@@ -229,9 +242,12 @@ class StreamClient(
     }
 
     /**
-     * Code pairing (issue #35): send the typed one-time code, receive the real
-     * 32-byte token + Mac name, then close. The caller stores the result and
-     * reconnects through the normal [connectWireless] handshake.
+     * Code pairing (issue #35), encrypted: an ephemeral P-256 ECDH (elliptic-
+     * curve Diffie-Hellman) exchange bound to the typed one-time code. The
+     * tablet proves it knows the code, and the Mac sends the 32-byte token
+     * back sealed with AES-GCM under a key derived from both, so the token
+     * never crosses the network in the clear. Then close; the caller stores
+     * the result and reconnects through the normal [connectWireless] handshake.
      * Throws [WirelessConnectError] or [PairingError] on failure. `use {}`
      * guarantees the socket closes on every path, including coroutine
      * cancellation and unexpected exceptions.
@@ -242,118 +258,159 @@ class StreamClient(
     ): PairingSuccess =
         withContext(Dispatchers.IO) {
             Log.i(TAG, "pairWithCode: trying $host:$port (device=$deviceName)")
+            val digits = code.filter { it.isDigit() }
+            if (digits.length != AuthHandshake.PAIR_CODE_LEN) throw PairingError.CodeRejected
             openWirelessSocket().use { s ->
                 // A silent listener (user typed the wrong port) must not hang
                 // the dialog forever: bound every blocking read.
                 s.soTimeout = PAIRING_READ_TIMEOUT_MS
+                val out = s.getOutputStream()
 
+                val keyPair = SecureChannel.generateP256KeyPair()
+                val ownPub = SecureChannel.encodeP256PublicKey(keyPair.public as java.security.interfaces.ECPublicKey)
+                val request = AuthHandshake.encodeSecurePairingRequest(ownPub, deviceName)
                 try {
-                    s.getOutputStream().write(AuthHandshake.encodePairingRequest(code, deviceName))
-                    s.getOutputStream().flush()
+                    out.write(request)
+                    out.flush()
                 } catch (e: IOException) {
                     throw WirelessConnectError.NetworkUnreachable
                 }
 
                 val header = ByteArray(5)
-                if (!readFully(s, header)) {
-                    throw WirelessConnectError.ProtocolError
-                }
+                if (!readFully(s, header)) throw WirelessConnectError.ProtocolError
                 val parsed =
-                    AuthHandshake.parsePairingResponseHeader(header)
-                        ?: throw WirelessConnectError.ProtocolError
+                    AuthHandshake.parseSecurePairingHelloHeader(header) ?: throw WirelessConnectError.ProtocolError
                 when (parsed) {
                     is AuthHandshake.PairingHeader.LegacyHost -> throw PairingError.HostTooOld
-                    is AuthHandshake.PairingHeader.Pairing -> {
-                        if (parsed.status != AuthHandshake.PairingStatus.OK) {
-                            throw PairingError.CodeRejected
-                        }
+                    is AuthHandshake.PairingHeader.Pairing ->
+                        if (parsed.status != AuthHandshake.PairingStatus.OK) throw PairingError.CodeRejected
+                }
+                val hostPub = ByteArray(SecureChannel.P256_PUBLIC_KEY_LEN)
+                if (!readFully(s, hostPub)) throw WirelessConnectError.ProtocolError
+
+                val keys =
+                    try {
+                        val shared = SecureChannel.p256SharedSecret(keyPair, hostPub)
+                        val th = SecureChannel.pairingTranscriptHash(request, hostPub)
+                        SecureChannel.derivePairingKeys(shared, digits, th)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "pairWithCode: key agreement failed: ${e.message}")
+                        throw WirelessConnectError.ProtocolError
                     }
+                try {
+                    out.write(keys.clientProof)
+                    out.flush()
+                } catch (e: IOException) {
+                    throw WirelessConnectError.NetworkUnreachable
                 }
 
-                val token = ByteArray(32)
-                val nameLenBuf = ByteArray(1)
-                if (!readFully(s, token) || !readFully(s, nameLenBuf)) {
+                val resHeader = ByteArray(5)
+                if (!readFully(s, resHeader)) throw WirelessConnectError.ProtocolError
+                val res =
+                    AuthHandshake.parsePairingResponseHeader(resHeader) ?: throw WirelessConnectError.ProtocolError
+                when (res) {
+                    is AuthHandshake.PairingHeader.LegacyHost -> throw PairingError.HostTooOld
+                    is AuthHandshake.PairingHeader.Pairing ->
+                        if (res.status != AuthHandshake.PairingStatus.OK) throw PairingError.CodeRejected
+                }
+                val lenBuf = ByteArray(2)
+                if (!readFully(s, lenBuf)) throw WirelessConnectError.ProtocolError
+                val sealedLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
+                if (sealedLen !in (32 + 1 + 1 + SecureChannel.TAG_LEN)..(32 + 1 + 64 + SecureChannel.TAG_LEN)) {
                     throw WirelessConnectError.ProtocolError
                 }
-                val nameLen = nameLenBuf[0].toInt() and 0xFF
-                if (nameLen !in 1..64) {
-                    throw WirelessConnectError.ProtocolError
-                }
-                val nameBuf = ByteArray(nameLen)
-                if (!readFully(s, nameBuf)) {
-                    throw WirelessConnectError.ProtocolError
-                }
-                val macName = String(nameBuf, Charsets.UTF_8)
-                Log.i(TAG, "pairWithCode: token issued by $macName")
+                val sealed = ByteArray(sealedLen)
+                if (!readFully(s, sealed)) throw WirelessConnectError.ProtocolError
+                val payload =
+                    try {
+                        SecureChannel.openPairingPayload(sealed, keys)
+                    } catch (e: java.security.GeneralSecurityException) {
+                        // Only someone who knows the code can seal this: treat
+                        // a failure as an impostor or corrupted reply.
+                        throw WirelessConnectError.ProtocolError
+                    }
+                val token = payload.copyOfRange(0, 32)
+                val nameLen = payload[32].toInt() and 0xFF
+                if (nameLen !in 1..64 || payload.size != 33 + nameLen) throw WirelessConnectError.ProtocolError
+                val macName = String(payload, 33, nameLen, Charsets.UTF_8)
+                Log.i(TAG, "pairWithCode: sealed token issued by $macName")
                 PairingSuccess(token, macName)
             }
         }
 
     /**
-     * Wireless connect: opens TCP, performs auth handshake, then resumes the existing receive loop on success.
+     * Wireless connect: opens TCP, runs the encrypted SSWE handshake (both
+     * sides prove they hold the token without sending it), then resumes the
+     * existing receive loop over AES-256-GCM records.
      * Throws WirelessConnectError on any failure.
      */
     suspend fun connectWireless(
         token: ByteArray,
         deviceName: String,
     ) = withContext(Dispatchers.IO) {
-        Log.i(TAG, "connectWireless: trying $host:$port (device=$deviceName, token bytes=${token.size})")
+        Log.i(TAG, "connectWireless: trying $host:$port (device=$deviceName)")
 
         val s = openWirelessSocket()
-        Log.i(
-            TAG,
-            "connectWireless: TCP connected, sending handshake (${37 + deviceName.toByteArray().size} bytes)",
-        )
-
-        val request = AuthHandshake.encodeRequest(token, deviceName)
-        try {
-            s.getOutputStream().write(request)
-            s.getOutputStream().flush()
-        } catch (e: IOException) {
+        fun fail(error: WirelessConnectError): Nothing {
             try {
                 s.close()
             } catch (_: IOException) {
             }
-            throw WirelessConnectError.NetworkUnreachable
+            throw error
+        }
+        // Bound handshake reads; cleared once streaming starts.
+        s.soTimeout = PAIRING_READ_TIMEOUT_MS
+
+        val clientNonce = SecureChannel.randomNonce()
+        val hello = AuthHandshake.encodeSecureRequest(clientNonce, deviceName)
+        try {
+            s.getOutputStream().write(hello)
+            s.getOutputStream().flush()
+        } catch (e: IOException) {
+            fail(WirelessConnectError.NetworkUnreachable)
+        }
+
+        val header = ByteArray(5)
+        if (!readFully(s, header)) fail(WirelessConnectError.ProtocolError)
+        when (val parsed = AuthHandshake.parseSecureHelloHeader(header) ?: fail(WirelessConnectError.ProtocolError)) {
+            is AuthHandshake.SecureHelloHeader.Plain -> {
+                // SSWR straight away: a Mac without encryption support.
+                Log.e(TAG, "connectWireless: Mac answered without encryption (${parsed.status}) — update the Mac app")
+                fail(WirelessConnectError.ProtocolError)
+            }
+            is AuthHandshake.SecureHelloHeader.Hello ->
+                if (parsed.status != AuthHandshake.ResponseStatus.OK) fail(WirelessConnectError.ProtocolError)
+        }
+        val hostNonce = ByteArray(SecureChannel.NONCE_LEN)
+        val hostProof = ByteArray(SecureChannel.PROOF_LEN)
+        if (!readFully(s, hostNonce) || !readFully(s, hostProof)) fail(WirelessConnectError.ProtocolError)
+
+        val keys = SecureChannel.deriveSessionKeys(token, hello, clientNonce, hostNonce)
+        if (!SecureChannel.constantTimeEquals(hostProof, keys.hostProof)) {
+            // The Mac doesn't hold our token: it was reset, or this isn't our Mac.
+            Log.e(TAG, "connectWireless: host proof mismatch")
+            fail(WirelessConnectError.TokenRejected)
+        }
+        try {
+            s.getOutputStream().write(keys.clientProof)
+            s.getOutputStream().flush()
+        } catch (e: IOException) {
+            fail(WirelessConnectError.NetworkUnreachable)
         }
 
         val responseBuf = ByteArray(5)
-        var read = 0
-        try {
-            while (read < 5) {
-                val r = s.getInputStream().read(responseBuf, read, 5 - read)
-                if (r <= 0) break
-                read += r
-            }
-        } catch (e: IOException) {
-            try {
-                s.close()
-            } catch (_: IOException) {
-            }
-            throw WirelessConnectError.NetworkUnreachable
-        }
-        if (read != 5) {
-            try {
-                s.close()
-            } catch (_: IOException) {
-            }
-            throw WirelessConnectError.ProtocolError
-        }
-
-        val status =
-            AuthHandshake.parseResponse(responseBuf) ?: run {
-                try {
-                    s.close()
-                } catch (_: IOException) {
-                }
-                throw WirelessConnectError.ProtocolError
-            }
+        if (!readFully(s, responseBuf)) fail(WirelessConnectError.ProtocolError)
+        val status = AuthHandshake.parseResponse(responseBuf) ?: fail(WirelessConnectError.ProtocolError)
         Log.i(TAG, "connectWireless: handshake response status=$status")
         when (status) {
             AuthHandshake.ResponseStatus.OK -> {
+                s.soTimeout = 0
                 socket = s
-                inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), 65536))
-                outputStream = java.io.DataOutputStream(s.getOutputStream())
+                inputStream =
+                    DataInputStream(
+                        java.io.BufferedInputStream(SecureInputStream(s.getInputStream(), keys.hostToClient), 65536),
+                    )
+                outputStream = java.io.DataOutputStream(SecureOutputStream(s.getOutputStream(), keys.clientToHost))
                 streamCodecIsHevc = true
                 codecNegotiated = false
                 prepareAdvertisements()
@@ -363,24 +420,12 @@ class StreamClient(
                 advertiseIdentity() // Likewise: the Mac picks this tablet's profile when type 8 lands
                 advertiseFrameMetadataSupport()
                 isConnected = true
-                diagLog("Wireless connected to $host:$port")
+                diagLog("Wireless connected (encrypted) to $host:$port")
                 onConnectionStatus?.invoke(true)
                 receiveData()
             }
-            AuthHandshake.ResponseStatus.INVALID_TOKEN -> {
-                try {
-                    s.close()
-                } catch (_: IOException) {
-                }
-                throw WirelessConnectError.TokenRejected
-            }
-            else -> {
-                try {
-                    s.close()
-                } catch (_: IOException) {
-                }
-                throw WirelessConnectError.ProtocolError
-            }
+            AuthHandshake.ResponseStatus.INVALID_TOKEN -> fail(WirelessConnectError.TokenRejected)
+            else -> fail(WirelessConnectError.ProtocolError)
         }
     }
 
@@ -566,7 +611,9 @@ class StreamClient(
 
         touchScope.launch {
             try {
-                socket?.getOutputStream()?.let { out ->
+                // Through outputStream, never the raw socket: on wireless it
+                // is the encrypting stream.
+                outputStream?.let { out ->
                     val count = pointerCount.coerceIn(1, 2)
                     val size = 6 + count * 8 // 1 type + 1 count + N*(4x+4y) + 4 action
                     val buffer = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN)
@@ -638,7 +685,7 @@ class StreamClient(
         if (!isConnected) return
         touchScope.launch {
             try {
-                socket?.getOutputStream()?.let { out ->
+                outputStream?.let { out ->
                     val buffer = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
                     buffer.put(4.toByte()) // Type 4: ping
                     buffer.putLong(System.nanoTime())

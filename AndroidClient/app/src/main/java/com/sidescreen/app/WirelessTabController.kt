@@ -174,7 +174,7 @@ class WirelessTabController(
                             "running. Open SideScreen on the Mac and scan the new QR to re-pair."
                     } else {
                         "No response from your Mac. Make sure both devices are on the same WiFi " +
-                            "and the Mac app is running, then scan the QR again."
+                            "or VPN (e.g. Tailscale) and the Mac app is running, then scan the QR again."
                     }
                 transition(State.REPAIR_NEEDED)
             }
@@ -191,7 +191,9 @@ class WirelessTabController(
             }
             is StreamClient.WirelessConnectError.ProtocolError -> {
                 views.repairTitle.text = "⚠ Connection error"
-                views.repairMessage.text = "Couldn't complete the secure handshake with the Mac. Scan the QR again."
+                views.repairMessage.text =
+                    "Couldn't complete the encrypted handshake with the Mac. Make sure the Mac " +
+                        "and the tablet both run the updated Side Screen, then scan the QR again."
                 transition(State.REPAIR_NEEDED)
             }
         }
