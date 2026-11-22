@@ -75,12 +75,22 @@ enum LANAddressResolver {
     /// still present on this Mac (for example the Tailscale address), else
     /// the primary LAN address.
     static func pairingIPv4(defaults: UserDefaults = .standard) -> String? {
-        if let chosen = defaults.string(forKey: pairingHostDefaultsKey),
-           allIPv4().contains(where: { $0.ip == chosen }) {
+        let chosen = defaults.string(forKey: pairingHostDefaultsKey) ?? ""
+        if chosen == customPairingHostTag {
+            let custom = (defaults.string(forKey: customPairingHostDefaultsKey) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !custom.isEmpty { return custom }
+        } else if !chosen.isEmpty, allIPv4().contains(where: { $0.ip == chosen }) {
             return chosen
         }
         return primaryIPv4()
     }
+
+    /// Picker value meaning "use the address typed in the custom field".
+    static let customPairingHostTag = "custom"
+    /// A typed address or host name for the QR code, such as a Tailscale
+    /// MagicDNS name, or a VPN address this Mac can't see on its own interfaces.
+    static let customPairingHostDefaultsKey = "wireless.pairingHostCustom"
 
     /// 100.64.0.0/10 — Tailscale's address range.
     static func isCGNAT(_ ip: String) -> Bool {

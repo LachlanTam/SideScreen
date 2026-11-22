@@ -1633,6 +1633,7 @@ struct WirelessSection: View {
     /// Pick the Tailscale / VPN address to pair over a VPN.
     @AppStorage(LANAddressResolver.pairingHostDefaultsKey) private var pairingHost: String = ""
     @State private var addressCandidates: [LANAddressResolver.Candidate] = []
+    @AppStorage(LANAddressResolver.customPairingHostDefaultsKey) private var customPairingHost: String = ""
     @State private var showResetConfirm = false
     /// Used to force the relative-time labels to recompute every tick even when
     /// the underlying lastConnected timestamp hasn't changed (e.g. while a
@@ -1675,17 +1676,25 @@ struct WirelessSection: View {
                     Text(LANAddressResolver.pairingIPv4().map { "Listening: \($0):\(settings.port)" } ?? "WiFi disconnected — no LAN address")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(.secondary)
-                    if addressCandidates.count > 1 {
-                        Picker("Address in QR", selection: $pairingHost) {
-                            Text("Automatic").tag("")
-                            ForEach(addressCandidates, id: \.self) { candidate in
-                                Text(candidate.label).tag(candidate.ip)
-                            }
+                    // Always shown, even with one address: a VPN address the
+                    // Mac can't see (or a MagicDNS name) can be typed in.
+                    Picker("Address in QR", selection: $pairingHost) {
+                        Text("Automatic").tag("")
+                        ForEach(addressCandidates, id: \.self) { candidate in
+                            Text(candidate.label).tag(candidate.ip)
                         }
-                        .pickerStyle(.menu)
-                        .controlSize(.small)
-                        .frame(maxWidth: 320)
-                        .help("Choose your Tailscale or other VPN address to pair and connect over the VPN.")
+                        Text("Custom…").tag(LANAddressResolver.customPairingHostTag)
+                    }
+                    .pickerStyle(.menu)
+                    .controlSize(.small)
+                    .frame(maxWidth: 320)
+                    .help("Choose your Tailscale or other VPN address to pair and connect over the VPN.")
+                    if pairingHost == LANAddressResolver.customPairingHostTag {
+                        TextField("e.g. 100.101.102.103 or my-mac.tailnet.ts.net", text: $customPairingHost)
+                            .textFieldStyle(.roundedBorder)
+                            .controlSize(.small)
+                            .frame(maxWidth: 320)
+                            .onSubmit { refreshQR() }
                     }
                     Text("Wireless connections are end-to-end encrypted (AES-256-GCM).")
                         .font(.system(size: 10))
@@ -1782,6 +1791,7 @@ struct WirelessSection: View {
         // Deprecation is a compile-time warning only on Xcode 15+ SDKs.
         .onChange(of: settings.port) { _ in refreshQR() }
         .onChange(of: pairingHost) { _ in refreshQR() }
+        .onChange(of: customPairingHost) { _ in refreshQR() }
         .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { now in
             nowTick = now
             refreshPaired()
